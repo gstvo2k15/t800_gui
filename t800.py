@@ -2,10 +2,8 @@ import cv2
 import numpy as np
 import wave
 import math
-import os
 import time
 from moviepy import VideoFileClip, AudioFileClip
-
 
 INPUT = "input.mp4"
 TEMP_VIDEO = "t800_video_no_audio.mp4"
@@ -13,99 +11,92 @@ TEMP_AUDIO = "t800_sfx.wav"
 OUTPUT = "t800_hud_audio.mp4"
 
 MAX_FRAMES = None
-# MAX_FRAMES = 600
+# MAX_FRAMES = 900
 
 SAMPLE_RATE = 44100
 
-WHITE = (220, 245, 245)
-DIM = (120, 180, 180)
-DARK = (50, 40, 40)
-RED_BGR = (0, 0, 190)
+WHITE = (225, 250, 250)
+CYAN = (180, 245, 255)
+DIM = (110, 170, 175)
+DARK = (55, 30, 30)
+RED_BGR = (0, 0, 210)
 
 font = cv2.FONT_HERSHEY_SIMPLEX
 
 
-def put_text(img, text, x, y, scale=1.0, thickness=2, color=WHITE):
-    cv2.putText(img, text, (int(x), int(y)), font, scale, color, thickness, cv2.LINE_AA)
+def put(img, text, x, y, s=1.4, t=3, c=WHITE):
+    cv2.putText(img, text, (int(x), int(y)), font, s, c, t, cv2.LINE_AA)
 
 
-def typewriter(text, frame_id, start_frame, chars_per_frame=0.45):
-    n = int((frame_id - start_frame) * chars_per_frame)
-    if n <= 0:
-        return ""
-    return text[:min(n, len(text))]
+def typewriter(text, f, start, speed=0.8):
+    n = int((f - start) * speed)
+    return text[:max(0, min(len(text), n))]
 
 
-def is_typing(frame_id, start_frame, text, chars_per_frame=0.45):
-    n = int((frame_id - start_frame) * chars_per_frame)
-    return 0 <= n < len(text)
+def cursor(img, x, y, f, size=42):
+    if (f // 10) % 2 == 0:
+        cv2.rectangle(img, (int(x), int(y - size)), (int(x + size), int(y)), WHITE, -1)
 
 
-def draw_crosshair(img, cx, cy, r=95):
-    cv2.circle(img, (cx, cy), r, WHITE, 3, cv2.LINE_AA)
-    cv2.circle(img, (cx, cy), int(r * 0.48), DARK, 2, cv2.LINE_AA)
-
-    cv2.line(img, (cx - r, cy), (cx + r, cy), DARK, 2, cv2.LINE_AA)
-    cv2.line(img, (cx, cy - r), (cx, cy + r), DARK, 2, cv2.LINE_AA)
-
-    cv2.line(img, (cx - 14, cy), (cx + 14, cy), DARK, 2, cv2.LINE_AA)
-    cv2.line(img, (cx, cy - 14), (cx, cy + 14), DARK, 2, cv2.LINE_AA)
+def panel(img, x, y, w, h, border=2):
+    cv2.rectangle(img, (x, y), (x + w, y + h), (55, 12, 12), -1)
+    cv2.rectangle(img, (x, y), (x + w, y + h), DIM, border, cv2.LINE_AA)
 
 
-def draw_grid(img, x, y, w, h, cell=28, alpha_phase=1.0):
-    color = (
-        int(120 + 80 * alpha_phase),
-        int(190 + 40 * alpha_phase),
-        int(190 + 40 * alpha_phase),
-    )
-
-    for xx in range(x, x + w + 1, cell):
-        cv2.line(img, (xx, y), (xx, y + h), color, 1, cv2.LINE_AA)
-
-    for yy in range(y, y + h + 1, cell):
-        cv2.line(img, (x, yy), (x + w, yy), color, 1, cv2.LINE_AA)
-
-    cv2.rectangle(img, (x, y), (x + w, y + h), color, 2, cv2.LINE_AA)
+def scanlines(img):
+    img[::4, :] = (img[::4, :] * 0.55).astype(np.uint8)
+    img[1::4, :] = (img[1::4, :] * 0.8).astype(np.uint8)
 
 
-def draw_scan_line(img, frame_id):
+def scan_beam(img, f):
     h, w = img.shape[:2]
-    y = int((frame_id * 7) % h)
-    cv2.line(img, (0, y), (w, y), (255, 255, 255), 1, cv2.LINE_AA)
+    y = int((f * 8) % h)
+    cv2.line(img, (0, y), (w, y), WHITE, 1)
+    cv2.line(img, (0, max(0, y - 2)), (w, max(0, y - 2)), DIM, 1)
 
 
-def draw_cursor_box(img, x, y, frame_id, size=28):
-    if (frame_id // 12) % 2 == 0:
-        cv2.rectangle(img, (x, y - size), (x + size, y), WHITE, -1)
+def grid(img, x, y, w, h, cell=28):
+    for xx in range(x, x + w + 1, cell):
+        cv2.line(img, (xx, y), (xx, y + h), DIM, 1)
+    for yy in range(y, y + h + 1, cell):
+        cv2.line(img, (x, yy), (x + w, yy), DIM, 1)
+    cv2.rectangle(img, (x, y), (x + w, y + h), CYAN, 2)
 
 
-def draw_check_box(img, x, y, frame_id, start_frame):
-    size = 44
-
-    if frame_id < start_frame:
-        return
-
-    cv2.rectangle(img, (x, y), (x + size, y + size), WHITE, 3, cv2.LINE_AA)
-
-    progress = min(1.0, (frame_id - start_frame) / 18)
-
-    if progress > 0:
-        p1 = (x + 8, y + 24)
-        p2 = (x + int(18 * progress), y + int(36 * progress))
-
-        cv2.line(img, p1, p2, WHITE, 5, cv2.LINE_AA)
-
-    if progress > 0.45:
-        p2 = (x + 18, y + 36)
-        p3 = (
-            x + 18 + int(22 * ((progress - 0.45) / 0.55)),
-            y + 36 - int(30 * ((progress - 0.45) / 0.55)),
-        )
-        cv2.line(img, p2, p3, WHITE, 5, cv2.LINE_AA)
+def crosshair(img, cx, cy, r=90):
+    cv2.circle(img, (cx, cy), r, WHITE, 3, cv2.LINE_AA)
+    cv2.circle(img, (cx, cy), int(r * 0.45), DARK, 2, cv2.LINE_AA)
+    cv2.line(img, (cx - r, cy), (cx + r, cy), DARK, 2)
+    cv2.line(img, (cx, cy - r), (cx, cy + r), DARK, 2)
+    cv2.line(img, (cx - 16, cy), (cx + 16, cy), DARK, 2)
+    cv2.line(img, (cx, cy - 16), (cx, cy + 16), DARK, 2)
 
 
-def draw_scrolling_numbers(img, x, y, frame_id):
-    rows = [
+def edge_pointer(w, h, f):
+    cx, cy = w // 2, h // 2
+    phase = (f // 80) % 8
+    p = (f % 80) / 80.0
+    p = 0.5 - 0.5 * math.cos(p * math.pi)
+
+    targets = [
+        (80, h // 2),
+        (w - 80, h // 2),
+        (w // 2, 80),
+        (w // 2, h - 80),
+        (120, 120),
+        (w - 120, 120),
+        (120, h - 120),
+        (w - 120, h - 120),
+    ]
+
+    tx, ty = targets[phase]
+    x = int(cx + (tx - cx) * p)
+    y = int(cy + (ty - cy) * p)
+    return x, y
+
+
+def numbers(img, x, y, f, rows=7, s=1.25):
+    base = [
         "234654 453 30",
         "654334 450 16",
         "245261 865 26",
@@ -114,187 +105,234 @@ def draw_scrolling_numbers(img, x, y, frame_id):
         "356878 544 04",
         "664217 985 89",
         "254346 956 32",
+        "389 VEHI 55378",
+        "690 SIZE 38022",
+        "600 TSPD 23022",
+        "287 HPWR 12048",
     ]
-
-    offset = (frame_id // 4) % len(rows)
-
-    for i in range(6):
-        line = rows[(i + offset) % len(rows)]
-        put_text(img, line, x, y + i * 36, 1.0, 3)
+    off = (f // 5) % len(base)
+    for i in range(rows):
+        put(img, base[(off + i) % len(base)], x, y + i * int(38 * s), s, 3)
 
 
-def draw_route(img, frame_id):
+def checkbox(img, x, y, f, start):
+    size = 54
+    cv2.rectangle(img, (x, y), (x + size, y + size), WHITE, 3)
+    p = min(1.0, max(0, (f - start) / 22))
+    if p > 0:
+        cv2.rectangle(img, (x + 8, y + 8), (x + int(8 + 38 * p), y + 46), WHITE, -1)
+
+
+def compass(img, x, y):
+    r = 95
+    dirs = [
+        ("N", 0, -1), ("NE", 0.7, -0.7), ("E", 1, 0), ("SE", 0.7, 0.7),
+        ("S", 0, 1), ("SW", -0.7, 0.7), ("W", -1, 0), ("NW", -0.7, -0.7)
+    ]
+    for label, dx, dy in dirs:
+        cv2.line(img, (x, y), (int(x + dx * r), int(y + dy * r)), WHITE, 5)
+        put(img, label, x + dx * (r + 35) - 20, y + dy * (r + 35) + 10, 1.0, 3)
+
+
+def route_mode(img, f):
     h, w = img.shape[:2]
 
-    panel_x = int(w * 0.18)
-    panel_y = int(h * 0.20)
-    panel_w = int(w * 0.46)
-    panel_h = int(h * 0.43)
+    px, py = int(w * 0.13), int(h * 0.17)
+    pw, ph = int(w * 0.58), int(h * 0.48)
+    panel(img, px, py, pw, ph)
 
-    cv2.rectangle(img, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (70, 20, 20), -1)
-    cv2.rectangle(img, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), DIM, 2)
-
-    # circuito falso
-    for i in range(14):
-        x1 = panel_x + 30 + i * 45
-        y1 = panel_y + 40 + ((i * 37) % (panel_h - 80))
-        x2 = min(panel_x + panel_w - 20, x1 + 70)
-        y2 = y1 + ((-1) ** i) * 35
-
+    for i in range(26):
+        x1 = px + 35 + (i * 67) % (pw - 80)
+        y1 = py + 40 + (i * 43) % (ph - 70)
+        x2 = min(px + pw - 25, x1 + 80)
+        y2 = y1 + ((-1) ** i) * 36
         cv2.line(img, (x1, y1), (x2, y1), DARK, 2)
         cv2.line(img, (x2, y1), (x2, y2), DARK, 2)
 
     pts = [
-        (panel_x + 80, panel_y + 180),
-        (panel_x + 210, panel_y + 180),
-        (panel_x + 250, panel_y + 250),
-        (panel_x + 350, panel_y + 250),
-        (panel_x + 410, panel_y + 190),
-        (panel_x + 480, panel_y + 190),
+        (px + 90, py + 180),
+        (px + 250, py + 180),
+        (px + 320, py + 280),
+        (px + 470, py + 280),
+        (px + 560, py + 195),
+        (px + 680, py + 195),
     ]
 
-    progress = min(1.0, max(0, (frame_id - 80) / 120))
-    visible_segments = int(progress * (len(pts) - 1))
+    progress = min(1.0, max(0, (f % 180) / 120))
+    segs = int(progress * (len(pts) - 1))
 
-    for i in range(visible_segments):
-        cv2.line(img, pts[i], pts[i + 1], WHITE, 8, cv2.LINE_AA)
-        cv2.line(img, pts[i], pts[i + 1], DIM, 3, cv2.LINE_AA)
+    for i in range(segs):
+        cv2.line(img, pts[i], pts[i + 1], WHITE, 10, cv2.LINE_AA)
+        cv2.line(img, pts[i], pts[i + 1], CYAN, 4, cv2.LINE_AA)
 
-    put_text(img, "REROUTE", panel_x + 230, panel_y + panel_h + 70, 1.8, 3)
-    draw_cursor_box(img, panel_x + 520, panel_y + panel_h + 62, frame_id, 34)
+    put(img, "REROUTE", px + 260, py + ph + 80, 2.4, 5)
+    cursor(img, px + 620, py + ph + 72, f, 50)
+
+    if f % 180 > 110:
+        put(img, "ALTERNATE  POWER", px + 190, py + ph + 160, 2.4, 5)
+        checkbox(img, px + 770, py + ph + 112, f, 110)
+
+    put(img, "CODE:", 40, 135, 1.5, 4)
+    numbers(img, 40, 200, f, 7, 1.25)
+
+    put(img, "SEARCH PARAMETERS", int(w * 0.76), 140, 1.3, 4)
+    put(img, "GUIDE 654334", int(w * 0.76), 210, 1.15, 3)
+    put(img, "SPEED 245261", int(w * 0.76), 260, 1.15, 3)
+    put(img, "DIRECTION", int(w * 0.76), 540, 1.25, 4)
+
+
+def enhance_mode(img, f):
+    h, w = img.shape[:2]
+
+    put(img, "IMAGE", int(w * 0.27), int(h * 0.86), 2.8, 5)
+    put(img, "ENHANCE", int(w * 0.49), int(h * 0.86), 2.8, 5)
+    checkbox(img, int(w * 0.70), int(h * 0.80), f, 20)
+
+    put(img, "IMAGE", 38, 95, 1.45, 4)
+    put(img, "LEVEL", 38, 145, 1.45, 4)
+    numbers(img, 38, 230, f, 7, 1.25)
+
+    put(img, "IMAGE ENHANCE", int(w * 0.73), 95, 1.45, 4)
+    put(img, "MODE 423-6503", int(w * 0.73), 145, 1.45, 4)
+    put(img, "SEQUENCERS 20", int(w * 0.73), 250, 1.45, 4)
+
+    put(img, "SPEED PARAMETERS", int(w * 0.70), 430, 1.45, 4)
+    numbers(img, int(w * 0.70), 500, f, 6, 1.1)
+
+    compass(img, int(w * 0.84), int(h * 0.25))
+
+    put(img, "SCAN LEVELS:", 40, 420, 1.35, 4)
+    put(img, "****************", 40, 460, 1.15, 3)
+    put(img, "234654 453 30", 40, 515, 1.35, 4)
+
+    put(img, "LATERAL SPEED   573 3589", int(w * 0.63), int(h * 0.60), 1.35, 4)
+
+
+def scan_vehicle_mode(img, f):
+    h, w = img.shape[:2]
+
+    put(img, "CRITERIA:", 35, 130, 1.5, 4)
+    put(img, "**************", 35, 175, 1.2, 3)
+    numbers(img, 35, 240, f, 8, 1.22)
+
+    gx = int(w * 0.73)
+    gy = int(h * 0.16)
+    grid(img, gx, gy, 420, 260, 30)
+
+    put(img, "SCAN MODE 03958", int(w * 0.70), int(h * 0.63), 1.55, 4)
+    put(img, "ACQUIRE TRANSPORT", int(w * 0.70), int(h * 0.70), 1.55, 4)
+    put(img, "PRIORITY 1238905D", int(w * 0.70), int(h * 0.76), 1.55, 4)
+
+    put(img, "VEHI 35793 43457 33", int(w * 0.70), int(h * 0.84), 1.25, 4)
+    put(img, "MTRC 23491 46000 40", int(w * 0.70), int(h * 0.89), 1.25, 4)
+    put(img, "TRCT 24812 04343 00", int(w * 0.70), int(h * 0.94), 1.25, 4)
+
+
+def search_mode(img, f):
+    h, w = img.shape[:2]
+
+    cx, cy = edge_pointer(w, h, f)
+    crosshair(img, cx, cy, 95)
+
+    put(img, typewriter("SEARCH MODE", f % 160, 5, 0.9), int(w * 0.25), int(h * 0.82), 2.0, 4)
+    cursor(img, int(w * 0.25) + 520, int(h * 0.82), f, 46)
+
+    put(img, "PARAMETERS:", int(w * 0.73), 105, 1.35, 4)
+    numbers(img, int(w * 0.73), 170, f, 6, 1.1)
+
+    if (f // 50) % 2 == 0:
+        grid(img, int(w * 0.74), int(h * 0.51), 310, 190, 24)
+
+
+def ident_mode(img, f):
+    h, w = img.shape[:2]
+
+    panel(img, int(w * 0.20), int(h * 0.10), int(w * 0.45), int(h * 0.55))
+
+    put(img, "CODE:", 30, 140, 1.5, 4)
+    numbers(img, 30, 210, f, 6, 1.2)
+
+    put(img, "MATCH CRITERIA", int(w * 0.70), 110, 1.5, 4)
+    put(img, "NETFILE 342-589", int(w * 0.70), 190, 1.3, 4)
+    put(img, "MISSION PROFILE", int(w * 0.70), 240, 1.3, 4)
+    put(img, "CONNOR, JOHN", int(w * 0.70), 340, 1.55, 4)
+    put(img, "****************", int(w * 0.70), 385, 1.1, 3)
+    numbers(img, int(w * 0.70), 450, f, 8, 1.05)
+
+    put(img, "TARGET", int(w * 0.32), int(h * 0.46), 2.1, 5)
+    put(img, "ACQUIRED", int(w * 0.30), int(h * 0.54), 2.1, 5)
+
+    put(img, "IDENT  POSITIVE", int(w * 0.31), int(h * 0.88), 2.7, 5)
+    checkbox(img, int(w * 0.66), int(h * 0.81), f, 40)
+
+    put(img, "PERCENTAGE MATCH:", int(w * 0.70), int(h * 0.82), 1.25, 4)
+    put(img, "99.45036 PROBABLE", int(w * 0.70), int(h * 0.90), 1.25, 4)
 
 
 def draw_hud(frame, frame_id, fps):
     h, w = frame.shape[:2]
 
-    # rojo fuerte
     red = np.zeros_like(frame)
-    red[:, :] = RED_BGR
-    frame = cv2.addWeighted(frame, 0.38, red, 0.62, 0)
+    red[:] = RED_BGR
+    frame = cv2.addWeighted(frame, 0.30, red, 0.70, 0)
+    frame = cv2.convertScaleAbs(frame, alpha=1.32, beta=-30)
 
-    # contraste agresivo
-    frame = cv2.convertScaleAbs(frame, alpha=1.15, beta=-18)
-
-    # blur óptico leve
     if frame_id % 2 == 0:
         frame = cv2.GaussianBlur(frame, (3, 3), 0)
 
-    overlay = frame.copy()
+    img = frame.copy()
 
-    mode = (frame_id // int(fps * 5)) % 4
+    scanlines(img)
+    scan_beam(img, frame_id)
 
-    # scanline global
-    draw_scan_line(overlay, frame_id)
-
-    # efecto CRT horizontal
-    overlay[::5, :] = (overlay[::5, :] * 0.62).astype(np.uint8)
+    mode = (frame_id // int(fps * 4)) % 5
 
     if mode == 0:
-        title = typewriter("SEARCH MODE", frame_id, 15, 0.55)
-        put_text(overlay, title, int(w * 0.25), int(h * 0.82), 2.1, 4)
-        draw_cursor_box(overlay, int(w * 0.25) + len(title) * 48, int(h * 0.82), frame_id, 40)
-
-        cx = int(w * 0.18 + math.sin(frame_id * 0.04) * 90)
-        cy = int(h * 0.48 + math.cos(frame_id * 0.035) * 70)
-        draw_crosshair(overlay, cx, cy, 95)
-
-        put_text(overlay, "PARAMETERS:", int(w * 0.74), 110, 1.1, 3)
-        draw_scrolling_numbers(overlay, int(w * 0.74), 165, frame_id)
-
-        if frame_id % 90 > 45:
-            draw_grid(overlay, int(w * 0.76), int(h * 0.47), 240, 170, 22)
-
+        search_mode(img, frame_id)
     elif mode == 1:
-        draw_route(overlay, frame_id)
-
-        put_text(overlay, "CODE:", 35, 150, 1.1, 3)
-        draw_scrolling_numbers(overlay, 35, 205, frame_id)
-
-        put_text(overlay, "SEARCH PARAMETERS", int(w * 0.75), 170, 1.0, 3)
-        put_text(overlay, "SPEED", int(w * 0.75), 500, 1.0, 3)
-        put_text(overlay, "DIRECTION", int(w * 0.75), 550, 1.0, 3)
-
+        route_mode(img, frame_id)
     elif mode == 2:
-        put_text(overlay, "IMAGE", int(w * 0.27), int(h * 0.85), 2.0, 4)
-        put_text(overlay, "ENHANCE", int(w * 0.48), int(h * 0.85), 2.0, 4)
-        draw_check_box(overlay, int(w * 0.67), int(h * 0.80), frame_id, int(fps * 11))
-
-        put_text(overlay, "IMAGE", 35, 95, 1.1, 3)
-        put_text(overlay, "LEVEL", 35, 135, 1.1, 3)
-        draw_scrolling_numbers(overlay, 35, 210, frame_id)
-
-        put_text(overlay, "IMAGE ENHANCE", int(w * 0.73), 95, 1.1, 3)
-        put_text(overlay, "MODE 423-6503", int(w * 0.73), 135, 1.1, 3)
-        put_text(overlay, "SEQUENCERS 20", int(w * 0.73), 230, 1.1, 3)
-
-        put_text(overlay, "SPEED PARAMETERS", int(w * 0.72), 420, 1.1, 3)
-        put_text(overlay, "HUE1  234654 453 30", int(w * 0.72), 480, 1.0, 3)
-        put_text(overlay, "SATU  654334 450 16", int(w * 0.72), 520, 1.0, 3)
-        put_text(overlay, "BALN  245261 865 26", int(w * 0.72), 560, 1.0, 3)
-
+        enhance_mode(img, frame_id)
+    elif mode == 3:
+        scan_vehicle_mode(img, frame_id)
     else:
-        put_text(overlay, "ANALYSIS:   MATCH:", 35, 120, 1.1, 3)
-        put_text(overlay, "389 VEHI   55378", 35, 180, 1.0, 3)
-        put_text(overlay, "690 SIZE   38022", 35, 220, 1.0, 3)
-        put_text(overlay, "600 TSPD   23022", 35, 260, 1.0, 3)
-        put_text(overlay, "287 HPWR   12048", 35, 300, 1.0, 3)
+        ident_mode(img, frame_id)
 
-        put_text(overlay, "SCAN MODE LEVEL 43545", int(w * 0.32), 120, 1.1, 3)
-        put_text(overlay, "ASSESS VEHICLE", int(w * 0.32), 160, 1.1, 3)
+    noise = np.random.randint(-6, 7, img.shape, dtype=np.int16)
+    img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
-        put_text(overlay, "VISUAL:", int(w * 0.72), 260, 1.1, 3)
-        put_text(overlay, "MODEL 382", int(w * 0.72), 300, 1.1, 3)
-        put_text(overlay, "SLSTS", int(w * 0.72), 340, 1.1, 3)
-        put_text(overlay, "91 FATBOY", int(w * 0.72), 380, 1.1, 3)
-
-        draw_grid(overlay, int(w * 0.74), int(h * 0.12), 340, 220, 28)
-        draw_check_box(overlay, int(w * 0.66), int(h * 0.80), frame_id, int(fps * 16))
-
-    # ruido barato
-    noise = np.random.randint(-5, 6, overlay.shape, dtype=np.int16)
-    overlay = np.clip(overlay.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-
-    return overlay
+    return img
 
 
-def add_tone(audio, start_s, duration_s, freq=1200, volume=0.25):
-    start = int(start_s * SAMPLE_RATE)
-    length = int(duration_s * SAMPLE_RATE)
-
-    if start + length >= len(audio):
+def tone(audio, start, dur, freq, vol):
+    a = int(start * SAMPLE_RATE)
+    n = int(dur * SAMPLE_RATE)
+    if a + n >= len(audio):
         return
-
-    for i in range(length):
+    for i in range(n):
         t = i / SAMPLE_RATE
-        env = 1.0 - (i / length)
-        sample = math.sin(2 * math.pi * freq * t) * volume * env
-        audio[start + i] += sample
+        env = 1.0 - i / n
+        audio[a + i] += math.sin(2 * math.pi * freq * t) * vol * env
 
 
-def make_audio(duration_s, fps):
-    total_samples = int(duration_s * SAMPLE_RATE)
-    audio = np.zeros(total_samples, dtype=np.float32)
+def make_audio(duration):
+    audio = np.zeros(int(duration * SAMPLE_RATE), dtype=np.float32)
 
-    # tecleo rápido
-    for t in np.arange(0.3, duration_s, 0.075):
-        freq = np.random.choice([900, 1100, 1300, 1600])
-        add_tone(audio, t, 0.018, freq=freq, volume=0.18)
+    for t in np.arange(0.2, duration, 0.06):
+        tone(audio, t, 0.014, np.random.choice([900, 1100, 1350, 1700]), 0.16)
 
-    # scrolls
-    for t in np.arange(1.2, duration_s, 1.8):
-        for k in range(8):
-            add_tone(audio, t + k * 0.025, 0.015, freq=500 + k * 90, volume=0.14)
+    for t in np.arange(1.0, duration, 1.3):
+        for k in range(10):
+            tone(audio, t + k * 0.022, 0.012, 400 + k * 120, 0.13)
 
-    # checks
-    for t in np.arange(3.5, duration_s, 5.0):
-        add_tone(audio, t, 0.08, freq=700, volume=0.30)
-        add_tone(audio, t + 0.08, 0.10, freq=1400, volume=0.25)
+    for t in np.arange(3.2, duration, 4.0):
+        tone(audio, t, 0.06, 600, 0.28)
+        tone(audio, t + 0.07, 0.09, 1500, 0.24)
 
-    # pulso bajo
-    for t in np.arange(0, duration_s, 0.5):
-        add_tone(audio, t, 0.05, freq=90, volume=0.12)
+    for t in np.arange(0, duration, 0.45):
+        tone(audio, t, 0.05, 85, 0.11)
 
-    audio = np.clip(audio, -1.0, 1.0)
+    audio = np.clip(audio, -1, 1)
 
     with wave.open(TEMP_AUDIO, "w") as wf:
         wf.setnchannels(1)
@@ -303,60 +341,47 @@ def make_audio(duration_s, fps):
         wf.writeframes((audio * 32767).astype(np.int16).tobytes())
 
 
-def process_video():
+def main():
     cap = cv2.VideoCapture(INPUT)
-
     if not cap.isOpened():
         raise RuntimeError(f"No se pudo abrir {INPUT}")
 
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    if fps <= 0:
-        fps = 25
+    total_out = min(MAX_FRAMES, total) if MAX_FRAMES else total
 
-    if MAX_FRAMES:
-        total_out = min(MAX_FRAMES, total)
-    else:
-        total_out = total
-
-    duration_s = total_out / fps
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(TEMP_VIDEO, fourcc, fps, (w, h))
-
-    if not out.isOpened():
-        raise RuntimeError("No se pudo crear el video temporal")
+    out = cv2.VideoWriter(
+        TEMP_VIDEO,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (w, h),
+    )
 
     start = time.time()
     frame_id = 0
 
     while True:
         ret, frame = cap.read()
-
         if not ret:
             break
 
-        if MAX_FRAMES is not None and frame_id >= MAX_FRAMES:
+        if MAX_FRAMES and frame_id >= MAX_FRAMES:
             break
 
-        hud = draw_hud(frame, frame_id, fps)
-        out.write(hud)
-
+        out.write(draw_hud(frame, frame_id, fps))
         frame_id += 1
 
         if frame_id % 100 == 0:
             elapsed = time.time() - start
-            speed = frame_id / elapsed
-            pct = frame_id * 100 / total_out
-            print(f"{frame_id}/{total_out} frames | {pct:.1f}% | {speed:.2f} fps")
+            print(f"{frame_id}/{total_out} | {frame_id * 100 / total_out:.1f}% | {frame_id / elapsed:.2f} fps")
 
     cap.release()
     out.release()
 
-    make_audio(frame_id / fps, fps)
+    make_audio(frame_id / fps)
 
     video = VideoFileClip(TEMP_VIDEO)
     audio = AudioFileClip(TEMP_AUDIO)
@@ -367,8 +392,8 @@ def process_video():
         codec="libx264",
         audio_codec="aac",
         fps=fps,
+        bitrate="7000k",
         preset="medium",
-        bitrate="6000k",
     )
 
     video.close()
@@ -379,4 +404,4 @@ def process_video():
 
 
 if __name__ == "__main__":
-    process_video()
+    main()
