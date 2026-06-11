@@ -1,5 +1,3 @@
-# re_terminals
-
 # T800 gui generator for videos
 Basic repo for generate T800 gui in your videos
 
