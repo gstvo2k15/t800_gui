@@ -2,8 +2,12 @@ import cv2
 import numpy as np
 import random
 import time
+from moviepy import VideoFileClip, AudioFileClip, concatenate_audioclips
 
 INPUT = "input.mp4"
+SFX = "t800_sfx.mp3"
+
+TEMP_VIDEO = "t800_hud_silent.mp4"
 OUTPUT = "t800_hud.mp4"
 
 MAX_FRAMES = None
@@ -23,10 +27,10 @@ if fps <= 0:
     fps = 25
 
 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-out = cv2.VideoWriter(OUTPUT, fourcc, fps, (w, h))
+out = cv2.VideoWriter(TEMP_VIDEO, fourcc, fps, (w, h))
 
 if not out.isOpened():
-    raise RuntimeError(f"No se pudo crear el video de salida: {OUTPUT}")
+    raise RuntimeError(f"No se pudo crear el video temporal: {TEMP_VIDEO}")
 
 font = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -35,36 +39,19 @@ DARK = (90, 45, 45)
 
 
 def put_text(img, text, pos, scale=1.0, thickness=3, color=WHITE):
-    cv2.putText(
-        img,
-        text,
-        pos,
-        font,
-        scale,
-        color,
-        thickness,
-        cv2.LINE_AA,
-    )
+    cv2.putText(img, text, pos, font, scale, color, thickness, cv2.LINE_AA)
 
 
 def typed(text, frame_id, start_frame, speed=0.75):
     n = int((frame_id - start_frame) * speed)
-
     if n <= 0:
         return ""
-
     return text[:min(len(text), n)]
 
 
 def cursor(img, x, y, frame_id, size=28):
     if (frame_id // 10) % 2 == 0:
-        cv2.rectangle(
-            img,
-            (int(x), int(y - size)),
-            (int(x + size), int(y)),
-            WHITE,
-            -1,
-        )
+        cv2.rectangle(img, (int(x), int(y - size)), (int(x + size), int(y)), WHITE, -1)
 
 
 def moving_pointer(frame_id):
@@ -244,6 +231,31 @@ while True:
 
 cap.release()
 out.release()
+
+print("Añadiendo audio...")
+
+video = VideoFileClip(TEMP_VIDEO)
+audio = AudioFileClip(SFX)
+
+if audio.duration < video.duration:
+    loops = int(video.duration // audio.duration) + 1
+    audio_clips = [AudioFileClip(SFX) for _ in range(loops)]
+    audio = concatenate_audioclips(audio_clips)
+
+audio = audio.subclipped(0, video.duration)
+
+final = video.with_audio(audio)
+
+final.write_videofile(
+    OUTPUT,
+    codec="libx264",
+    audio_codec="aac",
+    fps=fps,
+)
+
+video.close()
+audio.close()
+final.close()
 
 elapsed = time.time() - start
 
