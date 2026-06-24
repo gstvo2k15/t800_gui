@@ -1,14 +1,9 @@
-# re_terminals
+# T800 gui generator for videos
+Basic repo for generate T800 gui in your videos
 
-A fun simulation inspired by *Resident evil 2 & 3* main PC access for unlock RPD doors.
+## Usage
 
-![alt text](screen_re2a.png)
-
-![alt text](screen_re2b.png)
-
-![alt text](screen_re3a.png)
-
-![alt text](screen_re3b.png)
+Put your wished video as "input.mp4" and execute with `python t800.py` to generate "t800_hud.mp4" video.
 ---
 
 ## 🚀 Installation & Usage
@@ -26,13 +21,7 @@ pip install -r requirements.txt
 
 
 ### **2️⃣ Run the Program**
-`
-python re2_skycard.py
-
-python re3_notice.py
-
-python re3_safsprin.py  
-`
+`python t800.py`
 
 ### **3️⃣ Deactivate Virtual Environment when finished**
 `
@@ -49,11 +38,5 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
 
 pip install -r requirements.txt
 
-python re2_skycard.py
-
-python re2_guest.py
-
-python re3_notice.py
-
-python re3_safsprin.py    
+python t800.py
 ```
