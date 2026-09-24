@@ -67,3 +67,5 @@ openai.yaml
 data/*
 
 t800.cpython*
+__pycache__*
+preview/*

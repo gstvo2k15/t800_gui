@@ -12,45 +12,9 @@ OUTPUT = "t800_hud.mp4"
 MAX_FRAMES = None
 # MAX_FRAMES = 300
 
-cap = cv2.VideoCapture(INPUT)
-
-if not cap.isOpened():
-    raise RuntimeError(f"No se pudo abrir el video: {INPUT}")
-
-w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fps = cap.get(cv2.CAP_PROP_FPS)
-total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-if fps <= 0:
-    fps = 25
-
-fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-out = cv2.VideoWriter(TEMP_VIDEO, fourcc, fps, (w, h))
-
-if not out.isOpened():
-    raise RuntimeError(f"No se pudo crear el video temporal: {TEMP_VIDEO}")
-
-font = cv2.FONT_HERSHEY_SIMPLEX
-
-WHITE = (210, 230, 235)
-DARK = (90, 45, 45)
-
-
-def put_text(img, text, pos, scale=1.0, thickness=3, color=WHITE):
-    cv2.putText(img, text, pos, font, scale, color, thickness, cv2.LINE_AA)
-
-
-def typed(text, frame_id, start_frame, speed=0.75):
-    n = int((frame_id - start_frame) * speed)
-    if n <= 0:
-        return ""
-    return text[:min(len(text), n)]
-
-
-def cursor(img, x, y, frame_id, size=28):
-    if (frame_id // 10) % 2 == 0:
-        cv2.rectangle(img, (int(x), int(y - size)), (int(x + size), int(y)), WHITE, -1)
+# Dimensions are configured by render_video; importing the renderer has no side effects.
+w, h, fps = 1280, 720, 25.0
+WHITE = (218, 235, 235)
 
 
 class SceneTracker:
@@ -134,193 +98,135 @@ class SceneTracker:
         return tuple(np.rint(self.position).astype(int))
 
 
-def draw_crosshair(frame, cx, cy):
-    radius = max(24, int(min(w, h) * 0.055))
-    gap = max(5, radius // 6)
-    for start, end in ((0, 65), (115, 155), (205, 245), (295, 350)):
-        cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start, end,
-                    WHITE, 1, cv2.LINE_AA)
-    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-        cv2.line(frame, (cx + dx * gap, cy + dy * gap),
-                 (cx + dx * (radius + 8), cy + dy * (radius + 8)),
-                 WHITE, 1, cv2.LINE_AA)
-    cv2.circle(frame, (cx, cy), 2, WHITE, -1, cv2.LINE_AA)
-
-
-def draw_tracking_grid(frame, cx, cy, frame_id):
-    if frame_id % 160 <= 70:
-        return
-
-    gw = 220
-    gh = 150
-    cell = 22
-
-    x1 = min(max(cx + 140, 20), w - gw - 20)
-    y1 = min(max(cy - 80, 20), h - gh - 20)
-
-    for xx in range(x1, x1 + gw + 1, cell):
-        cv2.line(frame, (xx, y1), (xx, y1 + gh), WHITE, 1, cv2.LINE_AA)
-
-    for yy in range(y1, y1 + gh + 1, cell):
-        cv2.line(frame, (x1, yy), (x1 + gw, yy), WHITE, 1, cv2.LINE_AA)
-
-    cv2.rectangle(frame, (x1, y1), (x1 + gw, y1 + gh), WHITE, 2, cv2.LINE_AA)
-
-
 def draw_hud(frame, frame_id, target):
+    """Film-style red vision with compact, time-based diagnostic overlays."""
+    height, width = frame.shape[:2]
+    seconds = frame_id / fps
+    # Deep red midtones, black shadows, and near-white overexposed highlights.
+    levels = np.arange(256, dtype=np.float32) / 255
+    red = np.clip((levels - .045) * 1.48, 0, 1)
+    highlights = np.clip((levels - .56) / .40, 0, 1) ** 1.5
+    lut = np.stack((highlights * 210, highlights * 225, red * 255), axis=1)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    # Luminance survives the red filter, as in the film's monochrome POV.
-    frame = cv2.merge((gray // 12, gray // 5, np.clip(gray.astype(np.float32) * 0.74 + 32, 0, 255).astype(np.uint8)))
+    tinted = lut.astype(np.uint8)[gray]
 
-    x, y = 80, 100
+    # A fixed design space keeps the lettering legible at every output resolution.
+    canvas_h = 720
+    canvas_w = round(width / height * canvas_h)
+    overlay = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    margin = 24
+    top = 88
+    right = canvas_w - 310
+    tick = int(seconds * 8)
 
-    title_raw = "TRAJECTORY LOGGING:"
-    title = typed(title_raw, frame_id, 0, 0.55)
-    put_text(frame, title, (x, y), 1.1, 3)
+    def text(value, x, y, scale=.58):
+        cv2.putText(overlay, value, (int(x), int(y)), cv2.FONT_HERSHEY_DUPLEX,
+                    scale, WHITE, 1, cv2.LINE_AA)
 
-    if len(title) < len(title_raw):
-        cursor(frame, x + len(title) * 24, y, frame_id, 26)
+    def block(lines, x, y, reveal=0):
+        for i, line in enumerate(lines):
+            # Short terminal bursts instead of a long, frame-rate-dependent intro.
+            count = max(0, int((seconds - reveal - i * .065) * 85))
+            text(line[:count], x, y + i * 19)
 
-    nums = [
-        "5439 543 5435 65311",
-        "6465 656 7689 10930",
-        "54392 5432 875",
-    ]
+    def numbers(count, seed):
+        return [f"{(seed + i * 739 + tick * 13) % 100000:05d} "
+                f"{(463 + i * 37 + tick * 3) % 1000:03d} "
+                f"{(10 + i * 9 + tick) % 100:02d}" for i in range(count)]
 
-    for i, line in enumerate(nums):
-        text = typed(line, frame_id, 35 + i * 20, 0.9)
+    phase = int(seconds / 2.6) % 3
+    if phase == 0:
+        block(['ANALYSIS:  MATCH:', '******************',
+               '300 VEHI   86976', '680 SIZE   33022',
+               '900 TSPD   33022', '017 V-PWR  13044',
+               '106 GODE   20073', '708 HNGE   20667',
+               '090 CAPC   12447', '770 MAX:   14036',
+               '000 TORQ   00024', '740 SUSP   33974',
+               '110 IDLE   00006', '640 WGHT   70000',
+               '800 TANK   34767', '', 'ASSESS: SUITABLE'], margin, top)
+        block(['SCAN MODE LEVEL 41', 'TARGET ASSESSMENT'], right, top, .2)
+    elif phase == 1:
+        block(['SCAN LEVELS:', '***************'] + numbers(7, 23464), margin, top)
+        block(['SEARCH CRITERIA', 'MATCH MODE 6408', '', 'ALL LEVELS OPERATIVE'],
+              margin, canvas_h - 130)
+        block(['SYSTEM STATUS', 'OPTICAL ARRAY: ACTIVE'] + numbers(3, 65432), right, top)
+        block(['THREAT ASSESSMENT', 'ANALYSIS IN PROGRESS'], right, canvas_h - 90)
+    else:
+        block(['MAINTENANCE', 'PORT 4867-F', '', 'ADDRESS', 'CHECKSUM', 'VERIFIED', '']
+              + numbers(5, 48764), margin, top)
+        block(['INTERNAL CHRONOMETER', f'{seconds:010.3f}'], right, canvas_h - 70)
 
-        if frame_id > 180:
-            if i == 0:
-                text = f"{5439 + frame_id % 80} 543 {5435 + frame_id % 40} {65311 + frame_id % 90}"
-            elif i == 1:
-                text = f"{6465 + frame_id % 60} 656 {7689 + frame_id % 70} {10930 + frame_id % 50}"
-            else:
-                text = f"{54392 + frame_id % 99} {5432 + frame_id % 88} {875 + frame_id % 77}"
+    # Fine acquisition marks follow scene features, appearing only during a scan.
+    cx = int(target[0] / width * canvas_w)
+    cy = int(target[1] / height * canvas_h)
+    if .45 < seconds % 2.6 < 1.95:
+        radius, arm = 31, 11
+        for dx in (-1, 1):
+            for dy in (-1, 1):
+                x, y = cx + dx * radius, cy + dy * radius
+                cv2.line(overlay, (x, y), (x - dx * arm, y), WHITE, 1)
+                cv2.line(overlay, (x, y), (x, y - dy * arm), WHITE, 1)
+        cv2.line(overlay, (cx - 7, cy), (cx + 7, cy), WHITE, 1)
+        cv2.line(overlay, (cx, cy - 7), (cx, cy + 7), WHITE, 1)
+    if phase == 2:
+        gx, gy, gw, gh = canvas_w - 190, top - 20, 160, 112
+        for x in range(gx, gx + gw + 1, 10):
+            cv2.line(overlay, (x, gy), (x, gy + gh), WHITE, 1)
+        for y in range(gy, gy + gh + 1, 8):
+            cv2.line(overlay, (gx, y), (gx + gw, y), WHITE, 1)
 
-        put_text(frame, text, (x, y + 45 + i * 35), 1.0, 3)
-
-    cx, cy = target
-    draw_crosshair(frame, cx, cy)
-    draw_tracking_grid(frame, cx, cy, frame_id)
-
-    px = int(w * 0.78)
-    py = 130
-
-    param_title = typed("PARAMETERS:", frame_id, 20, 0.65)
-    put_text(frame, param_title, (px, py), 1.1, 3)
-
-    params = [
-        "3430  34  3430",
-        "7347  73  7347",
-        "2392  23  2392",
-        "5643   5  5643",
-        "3459   3  3459",
-        "4535  45  4535",
-    ]
-
-    for i, line in enumerate(params):
-        if frame_id < 130 + i * 10:
-            text = typed(line, frame_id, 80 + i * 12, 0.8)
-        else:
-            a = 3430 + ((frame_id + i * 17) % 700)
-            b = 3 + ((frame_id + i * 11) % 90)
-            c = 3430 + ((frame_id + i * 23) % 700)
-            text = f"{a:<5} {b:<3} {c:<5}"
-
-        put_text(frame, text, (px, py + 45 + i * 38), 1.0, 3)
-
-    left_1 = typed("PRIORITY OVERRIDE MULTIPLE TARGETS", frame_id, 70, 0.7)
-    left_2 = typed("THREAT ASSESSMENT: POTENTIAL DAMAGE", frame_id, 115, 0.7)
-
-    put_text(frame, left_1, (80, h - 120), 1.1, 3)
-    put_text(frame, left_2, (80, h - 80), 1.1, 3)
-
-    live_code = (
-        f"{534053 + frame_id % 9999} "
-        f"{543596 + frame_id % 777} "
-        f"876 874798 4745757 44"
-    )
-
-    put_text(frame, typed(live_code, frame_id, 160, 1.2), (80, h - 40), 0.95, 3)
-
-    right_x = int(w * 0.68)
-
-    r1 = typed("SELECT ALL TARGETS", frame_id, 90, 0.75)
-    r2 = typed("TERMINATION OVERRIDE", frame_id, 125, 0.75)
-    r3 = typed("DISABLE TARGETS ONLY", frame_id, 160, 0.75)
-
-    put_text(frame, r1, (right_x, h - 120), 1.1, 3)
-    put_text(frame, r2, (right_x, h - 80), 1.1, 3)
-    put_text(frame, r3, (right_x, h - 40), 1.1, 3)
-
-    if frame_id % 220 > 150:
-        put_text(frame, "SCAN MODE 03958", (right_x, h - 190), 1.15, 3)
-        put_text(frame, "ACQUIRE TRANSPORT", (right_x, h - 150), 1.15, 3)
-
-    frame[::4, :] = (frame[::4, :] * 0.92).astype(np.uint8)
-    return frame
+    # A restrained phosphor halo softens the digital typography.
+    glow = cv2.GaussianBlur(overlay, (5, 5), 1.1)
+    overlay = cv2.addWeighted(overlay, 1.0, glow, .25, 0)
+    overlay = cv2.resize(overlay, (width, height), interpolation=cv2.INTER_LINEAR)
+    result = np.maximum(tinted, overlay)
+    step = max(2, round(height / 360))
+    result[::step] = (result[::step].astype(np.uint16) * 97 // 100).astype(np.uint8)
+    return result
 
 
-start = time.time()
-frame_id = 0
-tracker = SceneTracker()
+def render_video():
+    global w, h, fps
+    cap = cv2.VideoCapture(INPUT)
+    if not cap.isOpened():
+        raise RuntimeError(f"No se pudo abrir el video: {INPUT}")
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    out = cv2.VideoWriter(TEMP_VIDEO, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    if not out.isOpened():
+        cap.release()
+        raise RuntimeError(f"No se pudo crear el video temporal: {TEMP_VIDEO}")
+    start = time.time()
+    frame_id = 0
+    tracker = SceneTracker()
+    try:
+        while MAX_FRAMES is None or frame_id < MAX_FRAMES:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            out.write(draw_hud(frame, frame_id, tracker.update(frame)))
+            frame_id += 1
+            if frame_id % 100 == 0:
+                print(f"{frame_id}/{total} frames", flush=True)
+    finally:
+        cap.release()
+        out.release()
 
-while True:
-    ret, frame = cap.read()
+    print("Añadiendo audio...", flush=True)
+    with VideoFileClip(TEMP_VIDEO) as video, AudioFileClip(SFX) as source_audio:
+        repeats = max(1, int(np.ceil(video.duration / source_audio.duration)))
+        audio = concatenate_audioclips([source_audio] * repeats).subclipped(0, video.duration)
+        final = video.with_audio(audio)
+        try:
+            final.write_videofile(OUTPUT, codec="libx264", audio_codec="aac", fps=fps,
+                                 logger=None)
+        finally:
+            final.close()
+            audio.close()
+    print(f"Video generado: {OUTPUT} | {frame_id} frames | {time.time() - start:.1f}s")
 
-    if not ret:
-        break
 
-    if MAX_FRAMES is not None and frame_id >= MAX_FRAMES:
-        break
-
-    hud = draw_hud(frame, frame_id, tracker.update(frame))
-    out.write(hud)
-
-    frame_id += 1
-
-    if frame_id % 100 == 0:
-        elapsed = time.time() - start
-        fps_proc = frame_id / elapsed if elapsed > 0 else 0
-
-        if total > 0:
-            percent = frame_id * 100 / total
-            print(f"{frame_id}/{total} frames | {percent:.1f}% | {fps_proc:.2f} fps")
-        else:
-            print(f"{frame_id} frames | {fps_proc:.2f} fps")
-
-cap.release()
-out.release()
-
-print("Añadiendo audio...")
-
-video = VideoFileClip(TEMP_VIDEO)
-audio = AudioFileClip(SFX)
-
-if audio.duration < video.duration:
-    loops = int(video.duration // audio.duration) + 1
-    audio_clips = [AudioFileClip(SFX) for _ in range(loops)]
-    audio = concatenate_audioclips(audio_clips)
-
-audio = audio.subclipped(0, video.duration)
-
-final = video.with_audio(audio)
-
-final.write_videofile(
-    OUTPUT,
-    codec="libx264",
-    audio_codec="aac",
-    fps=fps,
-)
-
-video.close()
-audio.close()
-final.close()
-
-elapsed = time.time() - start
-
-print()
-print(f"Video generado: {OUTPUT}")
-print(f"Frames procesados: {frame_id}")
-print(f"Tiempo total: {elapsed:.1f}s")
+if __name__ == "__main__":
+    render_video()
