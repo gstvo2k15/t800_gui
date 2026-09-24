@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-import random
 import time
 from moviepy import VideoFileClip, AudioFileClip, concatenate_audioclips
 
@@ -54,30 +53,98 @@ def cursor(img, x, y, frame_id, size=28):
         cv2.rectangle(img, (int(x), int(y - size)), (int(x + size), int(y)), WHITE, -1)
 
 
-def moving_pointer(frame_id):
-    cx0 = w // 2
-    cy0 = h // 2
+class SceneTracker:
+    """Keep the sight on a patch of the scene instead of animating it."""
 
-    radius_x = int(w * 0.22)
-    radius_y = int(h * 0.16)
+    def __init__(self):
+        self.position = np.array([w * 0.5, h * 0.5], dtype=np.float32)
+        self.destination = self.position.copy()
+        self.previous = None
+        self.points = None
+        self.age = 0
 
-    cx = int(cx0 + np.sin(frame_id * 0.025) * radius_x)
-    cy = int(cy0 + np.cos(frame_id * 0.018) * radius_y)
+    def update(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if self.previous is not None and self.points is not None and len(self.points) >= 5:
+            moved, status, _ = cv2.calcOpticalFlowPyrLK(
+                self.previous, gray, self.points, None,
+                winSize=(21, 21), maxLevel=2,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+            )
+            if moved is not None:
+                valid = status.ravel() == 1
+                old = self.points.reshape(-1, 2)[valid]
+                new = moved.reshape(-1, 2)[valid]
+                if len(new) >= 5:
+                    displacement = np.median(new - old, axis=0)
+                    residual = np.linalg.norm((new - old) - displacement, axis=1)
+                    inliers = residual < max(3.0, min(w, h) * 0.008)
+                    if np.count_nonzero(inliers) >= 5:
+                        displacement = np.median((new - old)[inliers], axis=0)
+                        # Reject cuts and bad optical-flow matches.
+                        if np.linalg.norm(displacement) < min(w, h) * 0.08:
+                            self.destination += displacement * 0.8
+                            self.points = new[inliers].reshape(-1, 1, 2)
+                        else:
+                            self.points = None
+                    else:
+                        self.points = None
+                else:
+                    self.points = None
 
-    return cx, cy
+        self.age += 1
+        # Every second, scan toward a new high-contrast detail in the scene.
+        # Keep the choices within the useful central field of view.
+        scan_interval = max(1, int(fps))
+        if self.age == 1 or self.age % scan_interval == 0:
+            small = cv2.resize(gray, (max(1, w // 4), max(1, h // 4)))
+            sh, sw = small.shape
+            area = np.zeros_like(small)
+            area[int(sh * .24):int(sh * .76), int(sw * .23):int(sw * .77)] = 255
+            candidates = cv2.goodFeaturesToTrack(
+                small, maxCorners=80, qualityLevel=0.02,
+                minDistance=max(6, min(sw, sh) // 16), mask=area,
+            )
+            if candidates is not None:
+                locations = candidates.reshape(-1, 2) * 4
+                distances = np.linalg.norm(locations - self.position, axis=1)
+                # Pick a distinct detail without jumping to the screen edge.
+                eligible = np.flatnonzero(
+                    (distances > min(w, h) * .10) &
+                    (distances < min(w, h) * .38)
+                )
+                if len(eligible):
+                    choice = eligible[(self.age // scan_interval) % len(eligible)]
+                    self.destination = locations[choice].astype(np.float32)
+                    self.points = None
+
+        margin = min(w, h) * 0.13
+        self.destination = np.clip(self.destination, [margin, margin], [w - margin, h - margin])
+        self.position += (self.destination - self.position) * 0.065
+        if self.points is None or len(self.points) < 12 or self.age % 24 == 0:
+            mask = np.zeros(gray.shape, dtype=np.uint8)
+            cx, cy = np.rint(self.destination).astype(int)
+            radius = int(min(w, h) * 0.16)
+            cv2.circle(mask, (cx, cy), radius, 255, -1)
+            self.points = cv2.goodFeaturesToTrack(
+                gray, maxCorners=60, qualityLevel=0.025,
+                minDistance=max(5, min(w, h) // 100), mask=mask,
+            )
+        self.previous = gray
+        return tuple(np.rint(self.position).astype(int))
 
 
 def draw_crosshair(frame, cx, cy):
-    radius = 110
-
-    cv2.circle(frame, (cx, cy), radius, WHITE, 3, cv2.LINE_AA)
-    cv2.circle(frame, (cx, cy), 55, DARK, 2, cv2.LINE_AA)
-
-    cv2.line(frame, (cx - radius, cy), (cx + radius, cy), DARK, 2, cv2.LINE_AA)
-    cv2.line(frame, (cx, cy - radius), (cx, cy + radius), DARK, 2, cv2.LINE_AA)
-
-    cv2.line(frame, (cx - 15, cy), (cx + 15, cy), DARK, 2, cv2.LINE_AA)
-    cv2.line(frame, (cx, cy - 15), (cx, cy + 15), DARK, 2, cv2.LINE_AA)
+    radius = max(24, int(min(w, h) * 0.055))
+    gap = max(5, radius // 6)
+    for start, end in ((0, 65), (115, 155), (205, 245), (295, 350)):
+        cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start, end,
+                    WHITE, 1, cv2.LINE_AA)
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        cv2.line(frame, (cx + dx * gap, cy + dy * gap),
+                 (cx + dx * (radius + 8), cy + dy * (radius + 8)),
+                 WHITE, 1, cv2.LINE_AA)
+    cv2.circle(frame, (cx, cy), 2, WHITE, -1, cv2.LINE_AA)
 
 
 def draw_tracking_grid(frame, cx, cy, frame_id):
@@ -100,12 +167,10 @@ def draw_tracking_grid(frame, cx, cy, frame_id):
     cv2.rectangle(frame, (x1, y1), (x1 + gw, y1 + gh), WHITE, 2, cv2.LINE_AA)
 
 
-def draw_hud(frame, frame_id):
-    red = np.zeros_like(frame)
-    red[:, :] = (0, 0, 180)
-
-    frame = cv2.addWeighted(frame, 0.45, red, 0.55, 0)
-    frame = cv2.convertScaleAbs(frame, alpha=0.95, beta=-8)
+def draw_hud(frame, frame_id, target):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # Luminance survives the red filter, as in the film's monochrome POV.
+    frame = cv2.merge((gray // 12, gray // 5, np.clip(gray.astype(np.float32) * 0.74 + 32, 0, 255).astype(np.uint8)))
 
     x, y = 80, 100
 
@@ -133,10 +198,9 @@ def draw_hud(frame, frame_id):
             else:
                 text = f"{54392 + frame_id % 99} {5432 + frame_id % 88} {875 + frame_id % 77}"
 
-        jitter = random.randint(-1, 1)
-        put_text(frame, text, (x + jitter, y + 45 + i * 35), 1.0, 3)
+        put_text(frame, text, (x, y + 45 + i * 35), 1.0, 3)
 
-    cx, cy = moving_pointer(frame_id)
+    cx, cy = target
     draw_crosshair(frame, cx, cy)
     draw_tracking_grid(frame, cx, cy, frame_id)
 
@@ -194,16 +258,13 @@ def draw_hud(frame, frame_id):
         put_text(frame, "SCAN MODE 03958", (right_x, h - 190), 1.15, 3)
         put_text(frame, "ACQUIRE TRANSPORT", (right_x, h - 150), 1.15, 3)
 
-    noise = np.random.randint(-6, 7, frame.shape, dtype=np.int16)
-    noisy = np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-
-    noisy[::6, :] = (noisy[::6, :] * 0.75).astype(np.uint8)
-
-    return noisy
+    frame[::4, :] = (frame[::4, :] * 0.92).astype(np.uint8)
+    return frame
 
 
 start = time.time()
 frame_id = 0
+tracker = SceneTracker()
 
 while True:
     ret, frame = cap.read()
@@ -214,7 +275,7 @@ while True:
     if MAX_FRAMES is not None and frame_id >= MAX_FRAMES:
         break
 
-    hud = draw_hud(frame, frame_id)
+    hud = draw_hud(frame, frame_id, tracker.update(frame))
     out.write(hud)
 
     frame_id += 1

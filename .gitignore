@@ -65,3 +65,5 @@ openai.yaml
 *.sh
 *.cjs
 data/*
+
+t800.cpython*
