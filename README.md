@@ -8,7 +8,7 @@ Put your wished video as "input.mp4" and execute with `python t800.py` to genera
 
 ## 🚀 Installation & Usage
 ### **1️⃣ Install Dependencies**
-Make sure you have Python 3 installed, then install required packages:
+Make sure you have Python 3.10 or newer installed, then install required packages:
 
 ```bash
 sudo apt install -yqq python3-tk python3.10-venv
@@ -40,3 +40,8 @@ pip install -r requirements.txt
 
 python t800.py
 ```
+## Rendering
+
+The renderer encodes H.264 video and AAC audio directly with FFmpeg, provided by `imageio-ffmpeg`. The soundtrack `t800_sfx.mp3` repeats to cover the video. Portrait videos use narrower HUD columns; odd dimensions are padded by one pixel for playback compatibility.
+
+Run from the directory containing `input.mp4` and `t800_sfx.mp3`. The output is replaced only after a successful export. Known premature read failures abort the export; when the source provides no frame count, end-of-file and decoding failure cannot be distinguished reliably.

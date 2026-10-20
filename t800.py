@@ -1,12 +1,17 @@
 import cv2
 import numpy as np
 import time
-from moviepy import VideoFileClip, AudioFileClip, concatenate_audioclips
+import math
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+import imageio_ffmpeg
 
 INPUT = "input.mp4"
 SFX = "t800_sfx.mp3"
 
-TEMP_VIDEO = "t800_hud_silent.mp4"
 OUTPUT = "t800_hud.mp4"
 
 MAX_FRAMES = None
@@ -26,6 +31,8 @@ class SceneTracker:
         self.previous = None
         self.points = None
         self.age = 0
+        self.scan_period = None
+        self.refresh_period = None
 
     def update(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -59,8 +66,9 @@ class SceneTracker:
         self.age += 1
         # Every second, scan toward a new high-contrast detail in the scene.
         # Keep the choices within the useful central field of view.
-        scan_interval = max(1, int(fps))
-        if self.age == 1 or self.age % scan_interval == 0:
+        scan_period = int((self.age - 1) / fps)
+        if scan_period != self.scan_period:
+            self.scan_period = scan_period
             small = cv2.resize(gray, (max(1, w // 4), max(1, h // 4)))
             sh, sw = small.shape
             area = np.zeros_like(small)
@@ -78,14 +86,17 @@ class SceneTracker:
                     (distances < min(w, h) * .38)
                 )
                 if len(eligible):
-                    choice = eligible[(self.age // scan_interval) % len(eligible)]
+                    choice = eligible[scan_period % len(eligible)]
                     self.destination = locations[choice].astype(np.float32)
                     self.points = None
 
         margin = min(w, h) * 0.13
         self.destination = np.clip(self.destination, [margin, margin], [w - margin, h - margin])
-        self.position += (self.destination - self.position) * 0.065
-        if self.points is None or len(self.points) < 12 or self.age % 24 == 0:
+        smoothing = 1 - (1 - 0.065) ** (25 / fps)
+        self.position += (self.destination - self.position) * smoothing
+        refresh_period = int((self.age - 1) / fps / (24 / 25))
+        if self.points is None or len(self.points) < 12 or refresh_period != self.refresh_period:
+            self.refresh_period = refresh_period
             mask = np.zeros(gray.shape, dtype=np.uint8)
             cx, cy = np.rint(self.destination).astype(int)
             radius = int(min(w, h) * 0.16)
@@ -114,14 +125,15 @@ def draw_hud(frame, frame_id, target):
     canvas_h = 720
     canvas_w = round(width / height * canvas_h)
     overlay = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
-    margin = 24
+    layout_scale = min(1.0, canvas_w / 720)
+    margin = round(24 * layout_scale)
     top = 88
-    right = canvas_w - 310
+    right = canvas_w - round(310 * layout_scale)
     tick = int(seconds * 8)
 
     def text(value, x, y, scale=.58):
         cv2.putText(overlay, value, (int(x), int(y)), cv2.FONT_HERSHEY_DUPLEX,
-                    scale, WHITE, 1, cv2.LINE_AA)
+                    scale * layout_scale, WHITE, 1, cv2.LINE_AA)
 
     def block(lines, x, y, reveal=0):
         for i, line in enumerate(lines):
@@ -169,7 +181,8 @@ def draw_hud(frame, frame_id, target):
         cv2.line(overlay, (cx - 7, cy), (cx + 7, cy), WHITE, 1)
         cv2.line(overlay, (cx, cy - 7), (cx, cy + 7), WHITE, 1)
     if phase == 2:
-        gx, gy, gw, gh = canvas_w - 190, top - 20, 160, 112
+        gw, gh = round(160 * layout_scale), 112
+        gx, gy = canvas_w - round(190 * layout_scale), top - 20
         for x in range(gx, gx + gw + 1, 10):
             cv2.line(overlay, (x, gy), (x, gy + gh), WHITE, 1)
         for y in range(gy, gy + gh + 1, 8):
@@ -186,46 +199,83 @@ def draw_hud(frame, frame_id, target):
 
 
 def render_video():
+    """Stream BGR frames to FFmpeg and publish only a complete export."""
     global w, h, fps
     cap = cv2.VideoCapture(INPUT)
-    if not cap.isOpened():
-        raise RuntimeError(f"No se pudo abrir el video: {INPUT}")
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    out = cv2.VideoWriter(TEMP_VIDEO, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-    if not out.isOpened():
-        cap.release()
-        raise RuntimeError(f"No se pudo crear el video temporal: {TEMP_VIDEO}")
-    start = time.time()
+    start = time.monotonic()
     frame_id = 0
-    tracker = SceneTracker()
     try:
-        while MAX_FRAMES is None or frame_id < MAX_FRAMES:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            out.write(draw_hud(frame, frame_id, tracker.update(frame)))
-            frame_id += 1
-            if frame_id % 100 == 0:
-                print(f"{frame_id}/{total} frames", flush=True)
+        if not cap.isOpened():
+            raise RuntimeError(f"No se pudo abrir el video: {INPUT}")
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if w <= 0 or h <= 0 or not math.isfinite(fps) or fps <= 0:
+            raise RuntimeError("El video tiene dimensiones o FPS inválidos")
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if MAX_FRAMES is not None and MAX_FRAMES <= 0:
+            raise ValueError("MAX_FRAMES debe ser positivo")
+        if not Path(SFX).is_file():
+            raise RuntimeError(f"No se encontró el audio: {SFX}")
+        output = Path(OUTPUT).resolve()
+        tracker = SceneTracker()
+        # Stage beside the destination so replacement stays on the same filesystem.
+        with tempfile.TemporaryDirectory(prefix="t800-", dir=output.parent) as folder:
+            staged = Path(folder) / "render.mp4"
+            command = [
+                imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
+                "-f", "rawvideo", "-pixel_format", "bgr24",
+                "-video_size", f"{w}x{h}", "-framerate", str(fps), "-i", "pipe:0",
+                "-stream_loop", "-1", "-i", str(Path(SFX).resolve()),
+                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264",
+                "-preset", "medium", "-crf", "18",
+                "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-shortest", "-movflags", "+faststart", str(staged),
+            ]
+            with tempfile.TemporaryFile() as errors:
+                process = subprocess.Popen(
+                    command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                    stderr=errors,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
+                try:
+                    while MAX_FRAMES is None or frame_id < MAX_FRAMES:
+                        ret, frame = cap.read()
+                        if not ret:
+                            if frame_id == 0:
+                                raise RuntimeError("No se pudo leer ningún fotograma")
+                            if total > 0 and frame_id < total:
+                                raise RuntimeError(
+                                    f"Lectura interrumpida: {frame_id}/{total} fotogramas"
+                                )
+                            break
+                        rendered = draw_hud(frame, frame_id, tracker.update(frame))
+                        process.stdin.write(rendered.tobytes())
+                        frame_id += 1
+                        if frame_id % 100 == 0:
+                            print(f"{frame_id}/{total} frames", flush=True)
+                    process.stdin.close()
+                    returncode = process.wait()
+                    if returncode:
+                        errors.seek(0)
+                        raise RuntimeError(
+                            "FFmpeg no pudo exportar el video: "
+                            + errors.read().decode("utf-8", errors="replace")
+                        )
+                except BaseException:
+                    if process.poll() is None:
+                        process.terminate()
+                    process.wait()
+                    if not process.stdin.closed:
+                        try:
+                            process.stdin.close()
+                        except BrokenPipeError:
+                            pass
+                    raise
+            staged.replace(output)
     finally:
         cap.release()
-        out.release()
-
-    print("Añadiendo audio...", flush=True)
-    with VideoFileClip(TEMP_VIDEO) as video, AudioFileClip(SFX) as source_audio:
-        repeats = max(1, int(np.ceil(video.duration / source_audio.duration)))
-        audio = concatenate_audioclips([source_audio] * repeats).subclipped(0, video.duration)
-        final = video.with_audio(audio)
-        try:
-            final.write_videofile(OUTPUT, codec="libx264", audio_codec="aac", fps=fps,
-                                 logger=None)
-        finally:
-            final.close()
-            audio.close()
-    print(f"Video generado: {OUTPUT} | {frame_id} frames | {time.time() - start:.1f}s")
+    print(f"Video generado: {OUTPUT} | {frame_id} frames | {time.monotonic() - start:.1f}s")
 
 
 if __name__ == "__main__":
