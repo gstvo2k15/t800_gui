@@ -42,6 +42,8 @@ python t800.py
 ```
 ## Rendering
 
-The renderer encodes H.264 video and AAC audio directly with FFmpeg, provided by `imageio-ffmpeg`. The soundtrack `t800_sfx.mp3` repeats to cover the video. Portrait videos use narrower HUD columns; odd dimensions are padded by one pixel for playback compatibility.
+The renderer encodes H.264 video (CRF 14, slow preset) and 256 kb/s AAC audio directly with FFmpeg, provided by `imageio-ffmpeg`. It preserves the source resolution and frame rate. The red filter retains detail in bright areas instead of clipping them to solid red. Portrait videos use narrower HUD columns; odd dimensions are padded by one pixel for playback compatibility.
+
+For the soundtrack, it selects a steady fragment of up to five seconds from `t800_sfx.mp3`, comparing loudness and spectral variation and avoiding the attack and tail where possible. A crossfade of up to 0.4 seconds joins the ends, with power compensation to reduce volume dips. This PCM loop repeats to cover the video without repeatedly decoding the full MP3. The selected interval is printed during export. Automatic selection reduces audible restarts; prominent rhythmic or melodic motifs can still sound repetitive.
 
 Run from the directory containing `input.mp4` and `t800_sfx.mp3`. The output is replaced only after a successful export. Known premature read failures abort the export; when the source provides no frame count, end-of-file and decoding failure cannot be distinguished reliably.

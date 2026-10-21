@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import wave
 
 import imageio_ffmpeg
 
@@ -20,6 +21,78 @@ MAX_FRAMES = None
 # Dimensions are configured by render_video; importing the renderer has no side effects.
 w, h, fps = 1280, 720, 25.0
 WHITE = (218, 235, 235)
+
+
+def make_audio_loop(samples, sample_rate):
+    """Find a steady interior bed and blend its ends into a periodic waveform."""
+    if len(samples) < 4 or not np.isfinite(samples).all():
+        raise ValueError("El audio no contiene suficientes muestras válidas")
+    # Compare short blocks by loudness and spectral shape, preserving both channels.
+    block_size = max(1, round(sample_rate * .1))
+    count = len(samples) // block_size
+    length = min(round(sample_rate * 5), len(samples))
+    length_blocks = length // block_size
+    start = 0
+    if count >= 20:
+        blocks = samples[:count * block_size].reshape(count, block_size, -1)
+        power = np.mean(blocks ** 2, axis=(1, 2))
+        loudness = 10 * np.log10(power + 1e-12)
+        spectrum = np.mean(np.abs(np.fft.rfft(blocks, axis=1)) ** 2, axis=2)
+        bands = np.array_split(spectrum, 12, axis=1)
+        features = np.column_stack([np.sum(band, axis=1) for band in bands])
+        features /= np.sum(features, axis=1, keepdims=True) + 1e-12
+        # Exclude the attack and tail when there is enough material.
+        margin = min(6, max(0, (count - length_blocks) // 2))
+        audible = loudness > np.max(loudness) - 24
+        best = float("inf")
+        for first in range(margin, count - length_blocks - margin + 1):
+            last = first + length_blocks
+            if not np.all(audible[first:last]):
+                continue
+            level = loudness[first:last]
+            shape = features[first:last]
+            score = (np.std(level) + .5 * np.ptp(level)
+                     + 20 * np.mean(np.std(shape, axis=0))
+                     + 10 * np.linalg.norm(np.mean(shape[:3], axis=0)
+                                           - np.mean(shape[-3:], axis=0)))
+            if score < best:
+                best, start = score, first * block_size
+    end = start + length
+    fragment = samples[start:end].astype(np.float32, copy=True)
+    fade = min(round(sample_rate * .4), len(fragment) // 4)
+    fade = max(1, fade)
+    head, tail = fragment[:fade], fragment[-fade:]
+    mix = np.linspace(0, 1, fade, dtype=np.float32)[:, None]
+    # Compensate for the power dip of unrelated signals during the crossfade.
+    denominator = np.sqrt(np.mean(head ** 2) * np.mean(tail ** 2))
+    correlation = np.clip(np.mean(head * tail) / max(denominator, 1e-12), -.5, 1)
+    gain = np.sqrt((1 - mix) ** 2 + mix ** 2 + 2 * correlation * mix * (1 - mix))
+    join = ((1 - mix) * tail + mix * head) / gain
+    loop = np.concatenate((fragment[fade:-fade], join))
+    return loop, start, end
+
+
+def prepare_audio_loop(source, destination):
+    """Decode once; repeat a PCM loop without MP3 encoder padding or restarts."""
+    sample_rate = 48000
+    decoded = subprocess.run([
+        imageio_ffmpeg.get_ffmpeg_exe(), "-v", "error", "-i", str(source),
+        "-vn", "-ar", str(sample_rate), "-ac", "2", "-f", "f32le", "pipe:1",
+    ], capture_output=True, creationflags=(
+        subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    ))
+    if decoded.returncode:
+        raise RuntimeError("No se pudo decodificar el audio: "
+                           + decoded.stderr.decode("utf-8", errors="replace"))
+    samples = np.frombuffer(decoded.stdout, dtype="<f4").reshape(-1, 2)
+    loop, first, last = make_audio_loop(samples, sample_rate)
+    with wave.open(str(destination), "wb") as audio:
+        audio.setnchannels(2)
+        audio.setsampwidth(2)
+        audio.setframerate(sample_rate)
+        audio.writeframes((np.clip(loop, -1, 1) * 32767).astype("<i2").tobytes())
+    print(f"Audio estable: {first / sample_rate:.2f}–{last / sample_rate:.2f}s "
+          f"| bucle con fundido: {len(loop) / sample_rate:.2f}s", flush=True)
 
 
 class SceneTracker:
@@ -115,7 +188,7 @@ def draw_hud(frame, frame_id, target):
     seconds = frame_id / fps
     # Deep red midtones, black shadows, and near-white overexposed highlights.
     levels = np.arange(256, dtype=np.float32) / 255
-    red = np.clip((levels - .045) * 1.48, 0, 1)
+    red = np.clip((levels - .015) / .985, 0, 1) ** .9
     highlights = np.clip((levels - .56) / .40, 0, 1) ** 1.5
     lut = np.stack((highlights * 210, highlights * 225, red * 255), axis=1)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -222,15 +295,18 @@ def render_video():
         # Stage beside the destination so replacement stays on the same filesystem.
         with tempfile.TemporaryDirectory(prefix="t800-", dir=output.parent) as folder:
             staged = Path(folder) / "render.mp4"
+            soundtrack = Path(folder) / "loop.wav"
+            prepare_audio_loop(Path(SFX).resolve(), soundtrack)
             command = [
                 imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
                 "-f", "rawvideo", "-pixel_format", "bgr24",
                 "-video_size", f"{w}x{h}", "-framerate", str(fps), "-i", "pipe:0",
-                "-stream_loop", "-1", "-i", str(Path(SFX).resolve()),
+                "-stream_loop", "-1", "-i", str(soundtrack),
                 "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264",
-                "-preset", "medium", "-crf", "18",
+                "-preset", "slow", "-crf", "14",
                 "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-shortest", "-movflags", "+faststart", str(staged),
+                "-c:a", "aac", "-b:a", "256k", "-shortest",
+                "-movflags", "+faststart", str(staged),
             ]
             with tempfile.TemporaryFile() as errors:
                 process = subprocess.Popen(

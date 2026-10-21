@@ -69,3 +69,7 @@ data/*
 t800.cpython*
 __pycache__*
 preview/*
+web*
+orphans*
+reference*
+/tests/
